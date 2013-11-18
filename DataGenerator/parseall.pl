@@ -2,90 +2,70 @@ use warnings;
 use strict;
 use XML::Simple;
 use Data::Dumper;
-use DBI;
-my $dbfile = 'new_db.sqlite';
-unlink $dbfile || die "Can't remove dbfile\n";
-my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile","","");
-$dbh->{autocommit} = 1;
+use MongoDB;
+use MongoDB::OID;
+
+my $client = new MongoDB::MongoClient();
+my $db = $client->get_database('newdb');#creates a new db called "newdb" if required
+$db->drop(); #clear any old junk before we start
 
 #we'll start by parsing out all the people data we have
 my $people_path = 'data\people.xml';
 open my $PFH, '<', $people_path;
 # now dump it in a db
-$dbh->do("CREATE TABLE PEOPLE (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key INTEGER, latest_name TEXT)");
 
 my ($peopleA, $mpsH, $lordsH, $ministersH) = parse_people($PFH);
 
-my $insert_person_query = $dbh->prepare('INSERT INTO PEOPLE(source_key, latest_name) VALUES(?,?)');
-
-$dbh->begin_work;
+my $peopleC = $db->get_collection('people');
 
 foreach my $person (@$peopleA){
-	
-    $insert_person_query->execute($person->[0], $person->[1]);
+    my $docH = {
+                   source_id   => $person->[0],
+                   latest_name => $person->[1]
+               };
+    $peopleC->insert($docH);               
 }
-$dbh->commit;
+
 close $PFH;
 
+
 #now we're interested in MPships
-$dbh->do("CREATE TABLE MPSHIPS (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key INTEGER, " .
-                                  "person_key REFERENCES PEOPLE(source_key) ON DELETE CASCADE, " .
-                                  "house TEXT, title TEXT, firstname TEXT, lastname TEXT, " .
-                                  "constituency TEXT, party TEXT, fromdate TEXT, todate TEXT, " .
-                                  "fromwhy TEXT, towhy TEXT)");
-                                  
-my $insert_mpship_query = $dbh->prepare('INSERT INTO MPSHIPS(source_key, person_key, house, title, firstname, '.
-                                        'lastname, constituency, party, fromdate, todate, '.
-                                        'fromwhy, towhy) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)');
-                                        
 foreach my $member_path ('data\all-members.xml', 'data\all-members-2010.xml'){;
   open my $MFH, '<', $member_path;
   # now dump it in a db
-
-
   my $ref = XMLin($MFH);
 
-  $dbh->begin_work;
-  my $mpshipH = $ref->{member};
-  
-  foreach my $mpshipid (keys %$mpshipH){
-    my $mpship = $mpshipH->{$mpshipid};
+  my $mpshipHH = $ref->{member};
+  my $mpshipsC = $db->get_collection('mpships');
+  foreach my $mpshipid (keys %$mpshipHH){
+    my $mpshipH = $mpshipHH->{$mpshipid};
     my ($domain, $class, $id) = split '/', $mpshipid;
-    my $person_id = $mpsH->{$id} || die "bugger, couldn't find person to link office $id to :(";
-    $insert_mpship_query->execute($id, $person_id, $mpship->{house}, $mpship->{title}, $mpship->{firstname},
-                                  $mpship->{lastname}, $mpship->{constituency}, $mpship->{party},
-                                  $mpship->{fromdate}, $mpship->{todate}, $mpship->{fromwhy}, $mpship->{towhy});
+    my $person_id = $mpsH->{$id} || warn "bugger, couldn't find person to link office $id to :(" ;
+    next unless $person_id;#this entry corresponds to an unknown person
+    $mpshipH->{'source_key'} = $id;
+    $mpshipH->{'person_key'} = $person_id;
+    
+    
+    $mpshipsC->insert($mpshipH);
   }
-  $dbh->commit;
   close $MFH;
 }
 
 #Lordships
 open my $LFH, '<', 'data\peers-ucl.xml' or die "couldnt get at lords file";
 my $ref = XMLin($LFH);
-$dbh->do("CREATE TABLE LORDSHIPS (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key INTEGER, " .
-                                  "person_key REFERENCES PEOPLE(source_key) ON DELETE CASCADE, " .
-                                  "house TEXT, forenames TEXT, forenames_full TEXT, title TEXT, " .
-                                  "lordname TEXT, lordofname TEXT, lordofname_full TEXT, county TEXT, " .
-                                  "peeragetype TEXT, affiliation TEXT, fromdate TEXT, todate TEXT, ex_MP TEXT)");
-
-my $insert_lordship_query = $dbh->prepare("insert into LORDSHIPS (source_key, person_key, house, forenames, forenames_full, title, " .
-                                  "lordname, lordofname, lordofname_full, county, peeragetype, affiliation, ".
-                                  "fromdate, todate, ex_MP) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-
                                   
-$dbh->begin_work;
-my $lordshipH = $ref->{lord};
-foreach my $lordshipid (keys %$lordshipH){
-  my $lordship = $lordshipH->{$lordshipid};
+my $lordshipHH = $ref->{lord};
+my $lordshipsC = $db->get_collection('lordships');
+foreach my $lordshipid (keys %$lordshipHH){
+  my $lordshipH = $lordshipHH->{$lordshipid};
   my ($domain, $class, $id) = split '/', $lordshipid;
-  my $person_id = $lordsH->{$id} || die "bugger, couldn't find person to link office $id to :(";
-  $insert_lordship_query->execute($id, $person_id, $lordship->{house}, $lordship->{forenames}, $lordship->{forenames_full},
-                                   $lordship->{title}, $lordship->{lordname}, $lordship->{lordofname},
-                                   $lordship->{lordofname_full}, $lordship->{county}, $lordship->{peeragetype}, $lordship->{affiliation},
-                                   $lordship->{fromdate}, $lordship->{todate}, $lordship->{ex_MP});
+  my $person_id = $lordsH->{$id} || warn "bugger, couldn't find person to link office $id to :(";
+  next unless $person_id;
+  $lordshipH->{'source_key'} = $id;
+  $lordshipH->{'person_key'} = $person_id;
+  $lordshipsC->insert($lordshipH);
 }
-$dbh->commit;
 close $LFH;
 
 sub parse_people{
@@ -103,7 +83,6 @@ sub parse_people{
     my $name = $peopleH->{$person_key}{latestname};
     push @people, [$p_id, $name];
     my $officesH = $peopleH->{$person_key}{office};
-    print Dumper($officesH) if $p_id == 14101;
     foreach my $office_key (keys %$officesH){
         if ($office_key eq 'id'){
             $office_key = $officesH->{$office_key};
