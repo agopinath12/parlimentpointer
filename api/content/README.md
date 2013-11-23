@@ -1,4 +1,4 @@
-# content-api
+# content
 
 FIXME
 
